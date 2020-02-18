@@ -175,7 +175,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// rxNICID so the packet is processed as defined in RFC 4861,
 		// as per RFC 4862 section 5.4.3.
 
-		if e.linkAddrCache.CheckLocalAddress(e.nicID, ProtocolNumber, targetAddr) == 0 {
+		if s.CheckLocalAddress(e.nicID, ProtocolNumber, targetAddr) == 0 {
 			// We don't have a useful answer; the best we can do is ignore the request.
 			return
 		}
@@ -197,7 +197,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 			switch opt := opt.(type) {
 			case header.NDPSourceLinkLayerAddressOption:
-				e.linkAddrCache.AddLinkAddress(e.nicID, r.RemoteAddress, opt.EthernetAddress())
+				e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, opt.EthernetAddress())
 			}
 		}
 
@@ -304,7 +304,12 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 			switch opt := opt.(type) {
 			case header.NDPTargetLinkLayerAddressOption:
-				e.linkAddrCache.AddLinkAddress(e.nicID, targetAddr, opt.EthernetAddress())
+				linkAddr := opt.EthernetAddress()
+				solicited := na.SolicitedFlag()
+				override := na.OverrideFlag()
+				isRouter := na.RouterFlag()
+
+				e.nud.HandleConfirmation(targetAddr, linkAddr, solicited, override, isRouter)
 			}
 		}
 
@@ -350,6 +355,72 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 			return
 		}
 
+		//
+		// Validate the RS as per RFC 4861 section 6.1.1.
+		//
+
+		stack := r.Stack()
+
+		// Is the NIC acting as a router?
+		if !stack.Forwarding() {
+			// ... No, silently drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
+		p := h.NDPPayload()
+
+		// Is the NDP payload of sufficient size to hold a Router
+		// Solicitation?
+		if len(p) < header.NDPRSMinimumSize {
+			// ... No, silently drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
+		rs := header.NDPRouterSolicit(p)
+		it, err := rs.Options().Iter(true)
+
+		// Are options valid as per the wire format?
+		if err != nil {
+			// ... No, silently drop the packet.
+			received.Invalid.Increment()
+			return
+		}
+
+		// If the RS has the source link layer option, update the link address
+		// cache with the link address for the sender.
+		for {
+			opt, done, err := it.Next()
+			if err != nil {
+				// This should never happen as Iter(true) above did not return an error.
+				panic(fmt.Sprintf("unexpected error when iterating over NDP options: %s", err))
+			}
+			if done {
+				break
+			}
+
+			switch opt := opt.(type) {
+			case header.NDPSourceLinkLayerAddressOption:
+				sourceAddr := iph.SourceAddress()
+
+				// Is the source IP address unspecified?
+				if sourceAddr == "" {
+					// ... Yes, silently drop the packet.
+					return
+				}
+
+				// A RS with a specified source IP address modifies the NUD state
+				// machine in the same way a reachability probe would.
+				e.nud.HandleProbe(sourceAddr, r.LocalAddress, header.IPv6ProtocolNumber, opt.EthernetAddress())
+			}
+		}
+
+		//
+		// At this point, we have a valid Router Solicitation, as far
+		// as RFC 4861 section 6.1.1 is concerned.
+		//
+
 	case header.ICMPv6RouterAdvert:
 		received.RouterAdvert.Increment()
 
@@ -373,10 +444,10 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		}
 
 		ra := header.NDPRouterAdvert(p)
-		opts := ra.Options()
+		it, err := ra.Options().Iter(true)
 
 		// Are options valid as per the wire format?
-		if _, err := opts.Iter(true); err != nil {
+		if err != nil {
 			// ...No, silently drop the packet.
 			received.Invalid.Increment()
 			return
@@ -392,7 +463,41 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		rxNICID := r.NICID()
 		stack.HandleNDPRA(rxNICID, routerAddr, ra)
 
+		// If the RA has the source link layer option, update the link address
+		// cache with the link address for the advertised router.
+		for {
+			opt, done, err := it.Next()
+			if err != nil {
+				// This should never happen as Iter(true) above did not return an error.
+				panic(fmt.Sprintf("unexpected error when iterating over NDP options: %s", err))
+			}
+			if done {
+				break
+			}
+
+			switch opt := opt.(type) {
+			case header.NDPSourceLinkLayerAddressOption:
+				e.nud.HandleProbe(routerAddr, r.LocalAddress, header.IPv6ProtocolNumber, opt.EthernetAddress())
+			}
+		}
+
 	case header.ICMPv6RedirectMsg:
+		// TODO(gvisor.dev/issue/2285): Call `e.nud.HandleProbe` after validating
+		// this redirect message, as per RFC 4871 section 7.3.3:
+		//
+		//    "A Neighbor Cache entry enters the STALE state when created as a
+		//    result of receiving packets other than solicited Neighbor
+		//    Advertisements (i.e., Router Solicitations, Router Advertisements,
+		//    Redirects, and Neighbor Solicitations).  These packets contain the
+		//    link-layer address of either the sender or, in the case of Redirect,
+		//    the redirection target.  However, receipt of these link-layer
+		//    addresses does not confirm reachability of the forward-direction path
+		//    to that node.  Placing a newly created Neighbor Cache entry for which
+		//    the link-layer address is known in the STALE state provides assurance
+		//    that path failures are detected quickly. In addition, should a cached
+		//    link-layer address be modified due to receiving one of the above
+		//    messages, the state SHOULD also be set to STALE to provide prompt
+		//    verification that the path to the new link-layer address is working."
 		received.RedirectMsg.Increment()
 		if !isNDPValid() {
 			received.Invalid.Increment()
@@ -426,7 +531,7 @@ func (*protocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 }
 
 // LinkAddressRequest implements stack.LinkAddressResolver.
-func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.LinkEndpoint) *tcpip.Error {
+func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkAddr tcpip.LinkAddress, linkEP stack.LinkEndpoint) *tcpip.Error {
 	snaddr := header.SolicitedNodeAddr(addr)
 
 	// TODO(b/148672031): Use stack.FindRoute instead of manually creating the
@@ -437,6 +542,10 @@ func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.
 		RemoteAddress:     snaddr,
 		RemoteLinkAddress: header.EthernetAddressFromMulticastIPv6Address(snaddr),
 	}
+	if linkAddr != "" {
+		r.RemoteLinkAddress = linkAddr
+	}
+
 	hdr := buffer.NewPrependable(int(linkEP.MaxHeaderLength()) + header.IPv6MinimumSize + header.ICMPv6NeighborAdvertSize)
 	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborAdvertSize))
 	pkt.SetType(header.ICMPv6NeighborSolicit)

@@ -118,6 +118,7 @@ func stringLayer(l Layer) string {
 		if v.IsNil() {
 			continue
 		}
+		v = reflect.Indirect(v)
 		ret = append(ret, fmt.Sprintf("%s:%v", t.Name, v))
 	}
 	return fmt.Sprintf("&%s{%s}", t, strings.Join(ret, " "))
